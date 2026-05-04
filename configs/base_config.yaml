@@ -1,0 +1,36 @@
+project:
+  name: birdclef-2026
+  seed: 42
+  num_classes: 234
+  sample_rate: 32000
+  window_duration: 5
+paths:
+  data_root: data/raw
+  train_audio: data/raw/train_audio
+  test_soundscapes: data/raw/test_soundscapes
+  train_csv: data/raw/train.csv
+  taxonomy_csv: data/raw/taxonomy.csv
+  output_dir: experiments
+  perch_onnx: models/perch_v2.onnx
+audio:
+  sample_rate: 32000
+  n_mels: 128
+  fmin: 50
+  fmax: 14000
+  target_length: 160000
+training:
+  epochs: 30
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  num_folds: 5
+  dropout: 0.3
+model:
+  embedding_dim: 1280
+  hidden_dims: [1024, 512, 256, 128]
+  dropout: 0.3
+inference:
+  batch_size: 32
+  temperature: 1.5
+  prior_blend: 0.2
+  onnx_threads: 4
