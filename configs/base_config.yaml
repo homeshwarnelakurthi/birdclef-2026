@@ -1,36 +1,124 @@
-project:
+# BirdCLEF+ 2026 — Base Configuration
+# Final result: 341st / 4,243 — Bronze Medal
+
+competition:
   name: birdclef-2026
-  seed: 42
-  num_classes: 234
+  metric: macro_roc_auc
+  n_classes: 234
   sample_rate: 32000
-  window_duration: 5
-paths:
-  data_root: data/raw
-  train_audio: data/raw/train_audio
-  test_soundscapes: data/raw/test_soundscapes
-  train_csv: data/raw/train.csv
-  taxonomy_csv: data/raw/taxonomy.csv
-  output_dir: experiments
-  perch_onnx: models/perch_v2.onnx
+  window_sec: 5
+  n_windows: 12
+  inference_limit_minutes: 90
+
 audio:
   sample_rate: 32000
-  n_mels: 128
+  window_sec: 5
+  window_samples: 160000
+  file_samples: 1920000  # 60s at 32kHz
+  n_mels: 64
+  n_fft: 1024
+  hop_length: 320
   fmin: 50
   fmax: 14000
-  target_length: 160000
-training:
-  epochs: 30
-  batch_size: 64
-  learning_rate: 0.001
+  top_db: 80
+
+proto_ssm:
+  d_model: 256          # upgraded from 128 in v3
+  d_state: 16
+  n_ssm_layers: 3       # upgraded from 2 in v3
+  dropout: 0.15
+  n_prototypes: 1
+  n_sites: 20
+  meta_dim: 16
+  use_cross_attn: true
+  cross_attn_heads: 4   # upgraded from 2 in v3
+
+proto_ssm_train:
+  n_epochs: 40
+  lr: 0.001
+  weight_decay: 0.002
+  val_ratio: 0.15
+  patience: 8
+  pos_weight_cap: 30.0
+  distill_weight: 0.1
+  proto_margin: 0.1
+  label_smoothing: 0.02
+  oof_n_splits: 3
+  mixup_alpha: 0.3
+  focal_gamma: 2.0
+  swa_start_frac: 0.7
+  swa_lr: 0.0005
+
+residual_ssm:
+  d_model: 64
+  d_state: 8
+  n_ssm_layers: 1
+  dropout: 0.1
+  correction_weight: 0.3
+  n_epochs: 30
+  lr: 0.001
+  patience: 8
+
+mlp_probes:
+  pca_dim: 128
+  min_pos: 5
+  C: 0.75
+  alpha: 0.45
+
+blend:
+  proto_weight: 0.60
+  sed_weight: 0.40
+  rank_average: true
+  lambda_prior: 0.5      # upgraded from 0.4
+  rank_aware_power: 0.6  # upgraded from 0.4
+
+tta:
+  shifts: [0, 1, -1, 2, -2]
+
+post_processing:
+  noise_suppression_gate: true
+  temporal_continuity_gate: true
+  sed_spike_gate: true
+  sonotype_mirroring: true
+  rare_class_threshold: true
+  taxonomy_smoothing: true
+
+temporal_gate:
+  kernel: t_distribution
+  sigma: 1.20
+  context_windows: 7  # 35 seconds
+
+rare_class_taxa:
+  - Amphibia
+  - Mammalia
+  - Reptilia
+
+sonotype_groups:
+  - [47158son15, 47158son16]
+  - [47158son09, 47158son12]
+  - [47158son02, 47158son14]
+  - [47158son13, 47158son21, 47158son22, 47158son23]
+
+efficientnet:
+  model_name: efficientnet_b0
+  num_classes: 234
+  epochs: 25
+  batch_size: 32          # num_workers MUST be 0 on Kaggle
+  num_workers: 0          # critical: prevents 30GB RAM crash
+  lr: 0.001
   weight_decay: 0.0001
-  num_folds: 5
-  dropout: 0.3
-model:
-  embedding_dim: 1280
-  hidden_dims: [1024, 512, 256, 128]
-  dropout: 0.3
-inference:
-  batch_size: 32
-  temperature: 1.5
-  prior_blend: 0.2
-  onnx_threads: 4
+  mixup_alpha: 0.4
+  use_amp: true
+  loss: asymmetric_loss
+  asl_gamma_neg: 4
+  asl_gamma_pos: 0
+  asl_clip: 0.05
+  precompute_spectrograms: true  # mandatory for Kaggle training
+
+paths:
+  base: /kaggle/input/competitions/birdclef-2026
+  perch_onnx: /kaggle/input/datasets/rishikeshjani/perch-onnx-for-birdclef-2026/perch_v2_no_dft.onnx
+  sed_dir: /kaggle/input/datasets/tuckerarrants/bc2026-distilled-sed-public
+  perch_meta: /kaggle/input/datasets/jaejohn/perch-meta
+  sgkfk_weights: /kaggle/input/datasets/hideyukizushi/sgkfk-202604041716
+  exp002b_sidecar: /kaggle/input/datasets/pilkwang/birdclef26-sidecar-exp002b-5s-weakaudio

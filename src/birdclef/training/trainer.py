@@ -1,94 +1,152 @@
-from __future__ import annotations
-from typing import Dict, Optional, Tuple
-import numpy as np, pandas as pd, torch, torch.nn as nn
-from sklearn.model_selection import StratifiedKFold
-from torch.optim import AdamW
+"""
+EfficientNet-B0 trainer for BirdCLEF+ 2026.
+
+Critical lessons from Kaggle training failures:
+1. num_workers MUST be 0 — any value > 0 causes 30GB RAM crash on Kaggle
+   Root cause: PyTorch DataLoader workers are child processes that copy full
+   parent RAM. With 5.5GB base + 2 workers = 16.5GB+ → OOM.
+2. Spectrograms MUST be precomputed to disk as .npy files before training.
+   On-the-fly librosa computation is too slow to feed the GPU (27s/batch).
+3. Validation batch_size should be same as training to avoid RAM spike.
+4. Delete train_loader before creating val_loader to release worker memory.
+"""
+
+import gc
+import time
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
-from birdclef.data.dataset import TrainDataset, build_dataloader
-from birdclef.models.bird_mlp import BirdMLP
-from birdclef.models.perch import PerchEmbedder
-from birdclef.training.losses import BCEWithLabelSmoothing
-from birdclef.training.scheduler import CosineWarmupScheduler
-from birdclef.utils.config import Config
-from birdclef.utils.logging import ExperimentLogger
-from birdclef.utils.metrics import compute_oof_score, macro_auc_skipping_empty
 
-class Trainer:
-    """Full 5-fold cross-validation training pipeline."""
-    def __init__(self, cfg: Config, perch: PerchEmbedder, logger=None):
-        self.cfg = cfg
-        self.perch = perch
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger = logger or ExperimentLogger(cfg.paths.output_dir)
-        self.logger.log.info(f"Device: {self.device}")
+from ..models.efficientnet import BirdModel
+from .losses import asymmetric_loss
 
-    def run(self) -> Dict:
-        df = pd.read_csv(self.cfg.paths.train_csv)
-        tax = pd.read_csv(self.cfg.paths.taxonomy_csv)
-        species_to_idx = {sp: i for i, sp in enumerate(tax["primary_label"].tolist())}
-        n = len(df)
-        oof_preds = np.zeros((n, self.cfg.project.num_classes), np.float32)
-        oof_labels = np.zeros((n, self.cfg.project.num_classes), np.float32)
-        skf = StratifiedKFold(n_splits=self.cfg.training.num_folds, shuffle=True,
-                              random_state=self.cfg.project.seed)
-        fold_aucs = []
-        for fold, (tr, va) in enumerate(skf.split(df, df["primary_label"])):
-            self.logger.log.info(f"\n=== FOLD {fold+1}/{self.cfg.training.num_folds} ===")
-            preds, labels = self._train_fold(fold, df, tr, va, species_to_idx)
-            oof_preds[va] = preds; oof_labels[va] = labels
-            auc = macro_auc_skipping_empty(labels, preds)
-            fold_aucs.append(auc)
-            self.logger.log_fold(fold+1, auc)
-        metrics = compute_oof_score(oof_preds, oof_labels)
-        self.logger.log_oof(metrics["macro_auc"], metrics["n_classes_scored"])
-        np.save(self.logger.run_dir / "oof_preds.npy", oof_preds)
-        np.save(self.logger.run_dir / "oof_labels.npy", oof_labels)
-        return {"oof_auc": metrics["macro_auc"], "fold_aucs": fold_aucs}
 
-    def _train_fold(self, fold, df, tr_idx, va_idx, species_to_idx):
-        cfg = self.cfg
-        train_ds = TrainDataset(df.iloc[tr_idx], cfg.paths.train_audio,
-                                species_to_idx, cfg.project.num_classes, augment=True)
-        val_ds = TrainDataset(df.iloc[va_idx], cfg.paths.train_audio,
-                              species_to_idx, cfg.project.num_classes, augment=False)
-        tr_loader = build_dataloader(train_ds, cfg.training.batch_size, True, cfg.training.num_workers)
-        va_loader = build_dataloader(val_ds, cfg.training.batch_size*2, False, cfg.training.num_workers)
-        model = BirdMLP(cfg.project.num_classes, cfg.model.embedding_dim,
-                        cfg.model.hidden_dims, cfg.model.dropout).to(self.device)
-        opt = AdamW(model.parameters(), cfg.training.learning_rate, weight_decay=cfg.training.weight_decay)
-        crit = BCEWithLabelSmoothing()
-        sched = CosineWarmupScheduler(opt, 3, cfg.training.epochs)
-        best_auc = 0.0
-        for epoch in range(1, cfg.training.epochs + 1):
-            loss = self._train_epoch(model, tr_loader, opt, crit)
-            auc, preds, labels = self._val_epoch(model, va_loader)
-            sched.step()
-            self.logger.log_epoch(epoch, train_loss=loss, val_auc=auc)
-            if auc > best_auc:
-                best_auc = auc
-                torch.save(model.state_dict(), self.logger.best_model_path(fold))
-        model.load_state_dict(torch.load(self.logger.best_model_path(fold), map_location=self.device))
-        _, final_preds, final_labels = self._val_epoch(model, va_loader)
-        return final_preds, final_labels
+def mixup_batch(x: torch.Tensor, y: torch.Tensor, alpha: float = 0.4):
+    """Mixup augmentation. Improves calibration for rare species."""
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], lam * y + (1 - lam) * y[idx]
 
-    def _train_epoch(self, model, loader, opt, crit):
-        model.train(); total = 0.0
-        for waves, labels in tqdm(loader, desc="Train", leave=False):
-            emb = torch.from_numpy(self.perch.embed(waves.numpy())).to(self.device)
-            labels = labels.to(self.device)
-            opt.zero_grad(set_to_none=True)
-            loss = crit(model(emb), labels)
-            loss.backward()
+
+def macro_auc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Competition metric — macro AUC skipping empty classes."""
+    aucs = []
+    for i in range(y_true.shape[1]):
+        if y_true[:, i].sum() > 0:
+            try:
+                aucs.append(roc_auc_score(y_true[:, i], y_pred[:, i]))
+            except Exception:
+                pass
+    return float(np.mean(aucs)) if aucs else 0.0
+
+
+def train_fold(fold: int, df, dataset_class, label_to_idx: dict, n_classes: int = 234):
+    """
+    Train one fold with DataParallel (2x T4 GPU).
+
+    IMPORTANT: num_workers=0 is mandatory on Kaggle to prevent RAM crash.
+    Precomputed spectrograms in df["spec_path"] are required.
+    """
+    train_df = df[df["fold"] != fold].reset_index(drop=True)
+    val_df = df[df["fold"] == fold].reset_index(drop=True)
+
+    model = BirdModel(num_classes=n_classes, pretrained=False)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    model = model.cuda()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=3, eta_min=1e-5)
+    scaler = torch.cuda.amp.GradScaler()
+    best_path = Path("/kaggle/working") / f"best_fold{fold}.pth"
+
+    for epoch in range(1, 4):
+        t0 = time.time()
+
+        # Training phase — create and destroy loader each epoch
+        train_ds = dataset_class(train_df, mode="train")
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=64,
+            shuffle=True,
+            num_workers=0,       # CRITICAL: must be 0 on Kaggle
+            pin_memory=False,
+            drop_last=True,
+        )
+
+        model.train()
+        train_loss = 0.0
+        for x, y in tqdm(train_loader, desc=f"Ep{epoch} Train", leave=False):
+            x, y = x.cuda(), y.cuda()
+            if random.random() < 0.5:
+                x, y = mixup_batch(x, y, alpha=0.4)
+            with torch.cuda.amp.autocast():
+                logits = model(x)
+                loss = asymmetric_loss(logits, y)
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); total += loss.item()
-        return total / len(loader)
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss += loss.item()
+            del x, y
 
-    @torch.no_grad()
-    def _val_epoch(self, model, loader):
-        model.eval(); all_p, all_l = [], []
-        for waves, labels in tqdm(loader, desc="Val", leave=False):
-            emb = torch.from_numpy(self.perch.embed(waves.numpy())).to(self.device)
-            all_p.append(torch.sigmoid(model(emb)).cpu().numpy())
-            all_l.append(labels.numpy())
-        p = np.concatenate(all_p); l = np.concatenate(all_l)
-        return macro_auc_skipping_empty(l, p), p, l
+        train_loss /= len(train_loader)
+        scheduler.step()
+
+        # CRITICAL: delete train loader before validation to free RAM
+        del train_loader, train_ds
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Validation phase
+        val_ds = dataset_class(val_df, mode="val")
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=64,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+        model.eval()
+        n_val = len(val_df)
+        val_preds = np.zeros((n_val, n_classes), dtype=np.float32)
+        val_labels = np.zeros((n_val, n_classes), dtype=np.float32)
+        ptr = 0
+
+        with torch.no_grad():
+            for x, y in tqdm(val_loader, desc=f"Ep{epoch} Val", leave=False):
+                bs = x.size(0)
+                with torch.cuda.amp.autocast():
+                    preds = torch.sigmoid(model(x.cuda())).cpu().numpy()
+                val_preds[ptr: ptr + bs] = preds
+                val_labels[ptr: ptr + bs] = y.numpy()
+                ptr += bs
+                del x, y, preds
+
+        labels_hard = (val_labels > 0.5).astype(np.float32)
+        val_auc = macro_auc(labels_hard, val_preds)
+
+        del val_loader, val_ds, val_preds, val_labels, labels_hard
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        elapsed = time.time() - t0
+        print(f"Ep {epoch:02d} | loss={train_loss:.4f} | val_auc={val_auc:.4f} | {elapsed:.0f}s")
+
+        state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+        torch.save(state, best_path)
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return val_auc
