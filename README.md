@@ -2,6 +2,13 @@
 
 **🏅 Final Result: 341st place out of 4,243 teams — Bronze Medal (Top 8%)**
 
+[![Kaggle](https://img.shields.io/badge/Kaggle-BirdCLEF%2B%202026-20BEFF?logo=kaggle)](https://www.kaggle.com/competitions/birdclef-2026)
+[![Bronze Medal](https://img.shields.io/badge/Medal-Bronze%20🥉-CD7F32)](https://www.kaggle.com/competitions/birdclef-2026/leaderboard)
+[![Rank](https://img.shields.io/badge/Rank-341st%20%2F%204243-brightgreen)](https://www.kaggle.com/competitions/birdclef-2026/leaderboard)
+[![Score](https://img.shields.io/badge/Public%20LB-0.950-blue)](https://www.kaggle.com/competitions/birdclef-2026/leaderboard)
+[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.10-orange?logo=pytorch)](https://pytorch.org/)
+
 Kaggle competition: [BirdCLEF+ 2026](https://www.kaggle.com/competitions/birdclef-2026)
 
 ---
